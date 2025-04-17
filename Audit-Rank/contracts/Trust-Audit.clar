@@ -1,4 +1,4 @@
-;; Audit reputation system Smart Contract
+;; Audit reputation system Smart
 ;; This smart contract implements a comprehensive audit reputation ecosystem that enables:
 ;; 1. Management of qualified auditors with verification and removal capabilities
 ;; 2. Reputation token issuance, transfer, and burning with proper access controls
@@ -20,6 +20,9 @@
 (define-constant ERR-SCORE-OUT-OF-RANGE (err u110))
 (define-constant ERR-INVALID-AUDIT-DATA (err u111))
 (define-constant ERR-AUDIT-NOT-FOUND (err u112))
+(define-constant ERR-INVALID-LOCK-PERIOD (err u113))
+(define-constant ERR-INVALID-RATING (err u114))
+(define-constant ERR-INVALID-AUDIT-ID (err u115))
 
 ;; Constants - System parameters
 (define-constant contract-administrator tx-sender)
@@ -30,6 +33,9 @@
 (define-constant reputation-decay-interval u52560) ;; Approximately 1 year in blocks (assuming 10-minute block time)
 (define-constant minimum-quality-score u0)
 (define-constant maximum-quality-score u100)
+(define-constant minimum-lock-period u1440) ;; Minimum 1 day (assuming 10-minute block time)
+(define-constant maximum-lock-period u525600) ;; Maximum 1 year (assuming 10-minute block time)
+(define-constant maximum-audit-id u1000000) ;; Reasonable upper limit for audit IDs
 
 ;; Token definition
 (define-fungible-token auditor-reputation-token total-token-supply-limit)
@@ -81,7 +87,15 @@
 )
 
 (define-private (calculate-audit-quality (completeness-score uint) (accuracy-score uint) (timeliness-score uint))
-    (/ (+ completeness-score (* accuracy-score u2) timeliness-score) u4))
+    ;; Validate input scores are within range before calculation
+    (if (and (>= completeness-score minimum-quality-score) 
+             (<= completeness-score maximum-quality-score)
+             (>= accuracy-score minimum-quality-score) 
+             (<= accuracy-score maximum-quality-score)
+             (>= timeliness-score minimum-quality-score) 
+             (<= timeliness-score maximum-quality-score))
+        (/ (+ completeness-score (* accuracy-score u2) timeliness-score) u4)
+        u0)) ;; Return 0 if any score is invalid
 
 (define-private (update-auditor-metrics (auditor principal) (new-quality-score uint))
     (let
@@ -107,6 +121,17 @@
         (if (>= average-quality-score u80)
             u125  ;; 1.25x multiplier for good performance
             u100))) ;; 1x multiplier for standard performance
+
+(define-private (validate-lock-period (lock-period uint))
+    (and (>= lock-period minimum-lock-period)
+         (<= lock-period maximum-lock-period)))
+
+(define-private (validate-rating (rating uint))
+    (and (>= rating minimum-quality-score)
+         (<= rating maximum-quality-score)))
+
+(define-private (validate-audit-id (audit-id uint))
+    (<= audit-id maximum-audit-id))
 
 ;; Token transfer functions
 (define-public (transfer-reputation (amount uint) (sender principal) (recipient principal) (memo (optional (buff 34))))
@@ -173,16 +198,16 @@
 (define-public (stake-reputation-tokens (amount uint) (lock-period uint))
     (let
         ((staker tx-sender)
-         (current-block block-height)
-         (unlock-block (+ current-block lock-period)))
+         (current-block block-height))
         (begin
             (asserts! (> amount u0) ERR-AMOUNT-MUST-BE-POSITIVE)
             (asserts! (<= amount (ft-get-balance auditor-reputation-token staker)) ERR-BALANCE-TOO-LOW)
+            (asserts! (validate-lock-period lock-period) ERR-INVALID-LOCK-PERIOD)
             (try! (ft-transfer? auditor-reputation-token amount staker (as-contract tx-sender)))
             (map-set token-staking-records staker
                 { staked-amount: amount,
-                  unlock-block-height: unlock-block })
-            (print {event: "tokens_staked", staker: staker, amount: amount, unlock-time: unlock-block})
+                  unlock-block-height: (+ current-block lock-period) })
+            (print {event: "tokens_staked", staker: staker, amount: amount, unlock-time: (+ current-block lock-period)})
             (ok true))))
 
 (define-public (unstake-reputation-tokens)
@@ -208,24 +233,26 @@
     (timeliness-rating uint)
     (audit-report-data (string-utf8 500)))
     (let
-        ((submitting-auditor tx-sender)
-         (final-quality-score (calculate-audit-quality completeness-rating accuracy-rating timeliness-rating)))
+        ((submitting-auditor tx-sender))
         (begin
             (asserts! (is-verified-auditor submitting-auditor) ERR-UNAUTHORIZED-ACCESS)
-            (asserts! (and (>= final-quality-score minimum-quality-score) 
-                          (<= final-quality-score maximum-quality-score)) 
-                     ERR-SCORE-OUT-OF-RANGE)
-            (map-set audit-submissions
-                { audit-id: audit-id, auditor: submitting-auditor }
-                { quality-score: final-quality-score,
-                  submission-time: block-height,
-                  audit-status: "completed" })
-            (update-auditor-metrics submitting-auditor final-quality-score)
-            (print {event: "audit_submitted",
-                   auditor: submitting-auditor,
-                   audit-id: audit-id,
-                   score: final-quality-score})
-            (ok true))))
+            (asserts! (validate-audit-id audit-id) ERR-INVALID-AUDIT-ID)
+            (asserts! (validate-rating completeness-rating) ERR-INVALID-RATING)
+            (asserts! (validate-rating accuracy-rating) ERR-INVALID-RATING)
+            (asserts! (validate-rating timeliness-rating) ERR-INVALID-RATING)
+            
+            (let ((final-quality-score (calculate-audit-quality completeness-rating accuracy-rating timeliness-rating)))
+                (map-set audit-submissions
+                    { audit-id: audit-id, auditor: submitting-auditor }
+                    { quality-score: final-quality-score,
+                      submission-time: block-height,
+                      audit-status: "completed" })
+                (update-auditor-metrics submitting-auditor final-quality-score)
+                (print {event: "audit_submitted",
+                       auditor: submitting-auditor,
+                       audit-id: audit-id,
+                       score: final-quality-score})
+                (ok true)))))
 
 ;; Read-only functions
 (define-read-only (get-decayed-reputation-balance (user principal))
